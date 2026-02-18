@@ -30,13 +30,19 @@ client.on('authenticated', () => {
 client.on('ready', () => {
     console.log('🤖 Bot is ready and listening for messages!');
     console.log(`🏪 Store: ${store.getShopName()} — ${store.isOpen() ? '🟢 OPEN' : '🔴 CLOSED'}`);
+    const botNum = client.info?.wid?.user || 'unknown';
     console.log(`📋 Available cakes: ${store.getAvailableCakes().join(', ')}`);
+    console.log(`📱 Bot connected as: ${botNum}`);
+    console.log(`👤 Owner number: ${process.env.OWNER_NUMBER}`);
 });
 
 // ─── Helpers ───
 function generateOrderId() {
     return 'CAKE-' + Math.floor(100 + Math.random() * 900);
 }
+
+// Lock to prevent message_create from processing bot's own replies
+let isProcessingOwner = false;
 
 async function sendText(chatId, text) {
     await client.sendMessage(chatId, text);
@@ -48,12 +54,6 @@ function getOwnerChatId() {
     const clean = ownerNumber.replace(/\D/g, '');
     const formatted = clean.startsWith('91') ? clean : `91${clean}`;
     return `${formatted}@c.us`;
-}
-
-function isOwner(phone) {
-    const ownerNumber = process.env.OWNER_NUMBER?.replace(/\D/g, '');
-    if (!ownerNumber) return false;
-    return phone.includes(ownerNumber) || ownerNumber.includes(phone);
 }
 
 // ─── Order Finalization ───
@@ -82,33 +82,10 @@ async function finalizeOrder(phone, chatId, session) {
         console.error('❌ Failed to save to sheets:', e.message);
     }
 
-    // Notify Owner (via terminal always, via WhatsApp only if owner ≠ bot's own number)
+    // Log order to terminal (always visible to owner)
     let summary = `📋 New Order: ${orderData.id} | ${orderData.cake} ${orderData.weight} | ${orderData.mode} | ${orderData.address}`;
     if (price) summary += ` | ₹${price}`;
     console.log(`\n🔔 ${summary}`);
-
-    const ownerChatId = getOwnerChatId();
-    const botNumber = client.info?.wid?.user;
-    const ownerNum = process.env.OWNER_NUMBER?.replace(/\D/g, '');
-    const isBotOwner = botNumber && ownerNum && (botNumber.includes(ownerNum) || ownerNum.includes(botNumber));
-
-    if (ownerChatId && !isBotOwner && chatId !== ownerChatId) {
-        let ownerMsg = `📋 *New Order!*\n`;
-        ownerMsg += `🆔 ID: ${orderData.id}\n`;
-        ownerMsg += `📱 Phone: ${orderData.phone}\n`;
-        ownerMsg += `🎂 Cake: ${orderData.cake}\n`;
-        ownerMsg += `⚖️ Weight: ${orderData.weight}\n`;
-        ownerMsg += `🚚 Mode: ${orderData.mode}\n`;
-        ownerMsg += `📍 Address: ${orderData.address}\n`;
-        if (price) ownerMsg += `💰 Price: ₹${price}\n`;
-        if (orderData.scheduledDate) ownerMsg += `📅 Scheduled: ${orderData.scheduledDate}\n`;
-        ownerMsg += `\n_Reply "${orderData.id} ready" to notify customer_`;
-        try {
-            await client.sendMessage(ownerChatId, ownerMsg);
-        } catch (e) {
-            console.error('❌ Failed to notify owner via WhatsApp:', e.message);
-        }
-    }
 
     stateManager.updateState(phone, 'COMPLETED');
     return orderData;
@@ -117,102 +94,89 @@ async function finalizeOrder(phone, chatId, session) {
 // ─── Handle Custom Cake Request ───
 async function handleCustomRequest(phone, chatId, message) {
     console.log(`🎨 Custom Cake Request from ${phone}: ${message}`);
-
-    const ownerChatId = getOwnerChatId();
-    const botNumber = client.info?.wid?.user;
-    const ownerNum = process.env.OWNER_NUMBER?.replace(/\D/g, '');
-    const isBotOwner = botNumber && ownerNum && (botNumber.includes(ownerNum) || ownerNum.includes(botNumber));
-
-    if (ownerChatId && !isBotOwner && chatId !== ownerChatId) {
-        let notification = `🎨 *Custom Cake Request!*\n`;
-        notification += `📱 From: ${phone}\n`;
-        notification += `💬 Request: "${message}"\n\n`;
-        notification += `_Reply directly to discuss details_`;
-        try {
-            await client.sendMessage(ownerChatId, notification);
-        } catch (e) {
-            console.error('❌ Failed to forward custom request:', e.message);
-        }
-    }
 }
 
-// ─── Main Message Handler ───
+// ═══════════════════════════════════════════
+// ─── OWNER PORTAL (self-messages via message_create) ───
+// ═══════════════════════════════════════════
+client.on('message_create', async (msg) => {
+    if (!msg.fromMe) return;
+    if (msg.from.includes('@g.us') || msg.from === 'status@broadcast') return;
+
+    // Prevent infinite loop: skip if we're already processing an owner command
+    if (isProcessingOwner) return;
+
+    const selfInput = msg.body?.trim();
+    if (!selfInput) return;
+
+    // For self-messages, use msg.to (the chat we're sending to)
+    const chatId = msg.to || msg.from;
+    const phone = chatId.replace('@c.us', '').replace('@lid', '');
+
+    // fromMe=true means this is sent FROM the bot's connected phone
+    // Since the bot IS the owner's phone, all self-messages are owner messages
+    console.log(`\n👤 Owner portal: "${selfInput}"`);
+
+    isProcessingOwner = true;
+    try {
+        const portalResponse = await ownerPortal.handleOwnerMessage(phone, selfInput);
+        if (portalResponse === null || portalResponse === undefined) { isProcessingOwner = false; return; }
+
+        if (typeof portalResponse === 'string') {
+            await sendText(chatId, portalResponse);
+        } else if (typeof portalResponse === 'object') {
+            if (portalResponse.type === 'status_update') {
+                const customerChatId = `${portalResponse.phone}@c.us`;
+                const statusMessages = {
+                    'Ready': `✅ *Your cake is ready!* Order ${portalResponse.orderId} 🎂`,
+                    'Done': `✅ *Order complete!* ${portalResponse.orderId} — Thank you! 💕`,
+                    'Preparing': `👨‍🍳 *Preparing your cake!* ${portalResponse.orderId} ⏳`,
+                    'Cancelled': `❌ *Order cancelled* ${portalResponse.orderId}`
+                };
+                const statusMsg = statusMessages[portalResponse.status] || `Order ${portalResponse.orderId}: *${portalResponse.status}*`;
+                await client.sendMessage(customerChatId, statusMsg);
+                await sendText(chatId, `✅ Customer notified: ${portalResponse.orderId} → ${portalResponse.status}`);
+            } else if (portalResponse.type === 'broadcast') {
+                try {
+                    const recentOrders = await sheets.getTodaysOrders();
+                    const phones = [...new Set(recentOrders.map(o => o.phone))];
+                    let sent = 0;
+                    for (const p of phones) {
+                        try {
+                            await client.sendMessage(`${p}@c.us`, portalResponse.message);
+                            sent++;
+                        } catch (e) { /* skip */ }
+                    }
+                    await sendText(chatId, `📢 Broadcast sent to *${sent}* customer(s)`);
+                } catch (e) {
+                    await sendText(chatId, `❌ Broadcast failed: ${e.message}`);
+                }
+            }
+        }
+    } catch (e) {
+        console.error('❌ Owner portal error:', e.message);
+        await sendText(chatId, `❌ Error: ${e.message}`);
+    } finally {
+        isProcessingOwner = false;
+    }
+});
+
+// ═══════════════════════════════════════════
+// ─── CUSTOMER MESSAGE HANDLER ───
+// ═══════════════════════════════════════════
 client.on('message', async (msg) => {
     if (msg.from.includes('@g.us') || msg.from === 'status@broadcast') return;
-    if (msg.fromMe) return;
+    if (msg.fromMe) return; // Self-messages handled by message_create above
 
     const chatId = msg.from;
-    const phone = chatId.replace('@c.us', '');
+    const phone = chatId.replace('@c.us', '').replace('@lid', '');
     const input = msg.body?.trim();
     const isLocation = msg.type === 'location';
     const hasLocation = msg.location;
 
-    console.log(`\n💬 Message from ${phone}: "${input}" (type: ${msg.type})`);
+    console.log(`\n💬 Customer ${phone}: "${input}" (type: ${msg.type})`);
 
     if (!input && !isLocation) return;
-
-    // ═════════════════════════════════════════
-    // ─── OWNER PORTAL ───
-    // ═════════════════════════════════════════
-    if (isOwner(phone) && input) {
-        try {
-            const portalResponse = await ownerPortal.handleOwnerMessage(phone, input);
-
-            if (portalResponse !== null && portalResponse !== undefined) {
-                // Handle special response types
-                if (typeof portalResponse === 'object') {
-                    if (portalResponse.type === 'status_update') {
-                        // Order status update — notify customer
-                        const customerChatId = `${portalResponse.phone}@c.us`;
-                        const statusMessages = {
-                            'Ready': `✅ *Your cake is ready!*\n\n🎂 Order ${portalResponse.orderId} is prepared.\n🏪 Pick it up at our shop!\n\nThank you! 💕`,
-                            'Done': `✅ *Your order is complete!*\n\n🎂 Order ${portalResponse.orderId} has been fulfilled.\nThank you for choosing ${store.getShopName()}! 💕\n\n_Type "order" for a new one!_`,
-                            'Preparing': `👨‍🍳 *Your cake is being prepared!*\n\n🎂 Order ${portalResponse.orderId} is in the oven.\nWe'll let you know when it's ready! ⏳`,
-                            'Cancelled': `❌ *Order Cancelled*\n\nOrder ${portalResponse.orderId} has been cancelled.\n\n_Type "order" for a new one!_`
-                        };
-                        const msg = statusMessages[portalResponse.status] || `📋 Order ${portalResponse.orderId}: *${portalResponse.status}*`;
-                        try {
-                            await client.sendMessage(customerChatId, msg);
-                            await sendText(chatId, `✅ Customer notified: ${portalResponse.orderId} → ${portalResponse.status}`);
-                        } catch (e) {
-                            await sendText(chatId, `❌ Failed to notify customer: ${e.message}`);
-                        }
-                        return;
-                    }
-
-                    if (portalResponse.type === 'broadcast') {
-                        // Broadcast to recent customers
-                        try {
-                            const recentOrders = await sheets.getTodaysOrders();
-                            const phones = [...new Set(recentOrders.map(o => o.phone))];
-                            let sent = 0;
-                            for (const p of phones) {
-                                try {
-                                    await client.sendMessage(`${p}@c.us`, portalResponse.message);
-                                    sent++;
-                                } catch (e) { /* skip failed */ }
-                            }
-                            await sendText(chatId, `✅ Broadcast sent to ${sent} customer(s)\n\n` + ownerPortal.handleOwnerMessage.__proto__); // Will fall through
-                            await sendText(chatId, `📢 Broadcast sent to *${sent}* customer(s)`);
-                        } catch (e) {
-                            await sendText(chatId, `❌ Broadcast failed: ${e.message}`);
-                        }
-                        return;
-                    }
-                }
-
-                // Regular text response from portal
-                await sendText(chatId, portalResponse);
-                return;
-            }
-        } catch (e) {
-            console.error('❌ Owner portal error:', e.message);
-        }
-    }
-
-    // ═════════════════════════════════════════
-    // ─── CUSTOMER FLOW ───
-    // ═════════════════════════════════════════
 
     // Check if store is closed
     if (!store.isOpen()) {
@@ -222,16 +186,13 @@ client.on('message', async (msg) => {
 
     const session = stateManager.getSession(phone);
     const state = session.state;
-    const startKeywords = ['order', 'menu'];
 
     try {
-        // ─── COMPLETED: Only restart on keywords ───
+        // ─── COMPLETED: Any new message restarts the flow ───
         if (state === 'COMPLETED') {
-            if (input && startKeywords.includes(input.toLowerCase())) {
-                stateManager.clearSession(phone);
-                const newSession = stateManager.getSession(phone);
-                await processWithAI(phone, chatId, 'I want to order a cake', newSession);
-            }
+            stateManager.clearSession(phone);
+            const newSession = stateManager.getSession(phone);
+            await processWithAI(phone, chatId, input, newSession);
             return;
         }
 
