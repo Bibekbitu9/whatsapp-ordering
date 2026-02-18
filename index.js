@@ -4,7 +4,8 @@ require('dotenv').config();
 
 const stateManager = require('./state_manager');
 const sheets = require('./utils/sheets');
-const { parseOrder, VALID_CAKES, VALID_WEIGHTS, VALID_MODES } = require('./gemini');
+const ai = require('./ai');
+const { getPrice, formatPrice, VALID_CAKES, VALID_WEIGHTS, VALID_MODES } = require('./utils/pricing');
 
 // ─── Initialize WhatsApp Client ───
 const client = new Client({
@@ -27,6 +28,9 @@ client.on('authenticated', () => {
 
 client.on('ready', () => {
     console.log('🤖 Bot is ready and listening for messages!');
+    console.log(`📋 Menu: ${VALID_CAKES.join(', ')}`);
+    console.log(`⚖️  Weights: ${VALID_WEIGHTS.join(', ')}`);
+    console.log(`🚚 Modes: ${VALID_MODES.join(', ')}`);
 });
 
 // ─── Helpers ───
@@ -38,29 +42,24 @@ async function sendText(chatId, text) {
     await client.sendMessage(chatId, text);
 }
 
-async function sendButtons(chatId, title, options) {
-    let text = `*${title}*\n\n`;
-    options.forEach((opt, i) => {
-        text += `${i + 1}. ${opt}\n`;
-    });
-    text += `\n_Reply with the number (1-${options.length})_`;
-    await client.sendMessage(chatId, text);
+function getOwnerChatId() {
+    const ownerNumber = process.env.OWNER_NUMBER;
+    if (!ownerNumber) return null;
+    const clean = ownerNumber.replace(/\D/g, '');
+    const formatted = clean.startsWith('91') ? clean : `91${clean}`;
+    return `${formatted}@c.us`;
 }
 
-function buildOrderSummary(session) {
-    const d = session.data;
-    let summary = `📋 *Order Summary*\n\n`;
-    summary += `🎂 Cake: *${d.cake}*\n`;
-    summary += `⚖️ Weight: *${d.weight}*\n`;
-    summary += `🚚 Mode: *${d.mode}*\n`;
-    if (d.mode === 'Delivery' && d.address) {
-        summary += `📍 Address: *${d.address}*\n`;
-    }
-    summary += `\nReply *yes* to confirm or *no* to cancel.`;
-    return summary;
+function isOwner(phone) {
+    const ownerNumber = process.env.OWNER_NUMBER?.replace(/\D/g, '');
+    if (!ownerNumber) return false;
+    return phone.includes(ownerNumber) || ownerNumber.includes(phone);
 }
 
+// ─── Order Finalization ───
 async function finalizeOrder(phone, chatId, session) {
+    const price = getPrice(session.data.cake, session.data.weight);
+
     const orderData = {
         id: session.data.orderId || generateOrderId(),
         phone: phone,
@@ -68,7 +67,10 @@ async function finalizeOrder(phone, chatId, session) {
         weight: session.data.weight,
         mode: session.data.mode,
         address: session.data.address || 'Pickup',
-        date: new Date().toISOString()
+        price: price ? formatPrice(price) : '',
+        scheduledDate: session.data.scheduledDate || '',
+        date: new Date().toISOString(),
+        status: 'New'
     };
 
     console.log('📦 Finalizing Order:', orderData);
@@ -82,12 +84,18 @@ async function finalizeOrder(phone, chatId, session) {
     }
 
     // Notify Owner
-    const ownerNumber = process.env.OWNER_NUMBER;
-    if (ownerNumber) {
-        const cleanNumber = ownerNumber.replace(/\D/g, '');
-        const formattedNumber = cleanNumber.startsWith('91') ? cleanNumber : `91${cleanNumber}`;
-        const ownerChatId = `${formattedNumber}@c.us`;
-        const summary = `📋 *New Order!*\nID: ${orderData.id}\nPhone: ${orderData.phone}\nCake: ${orderData.cake}\nWeight: ${orderData.weight}\nMode: ${orderData.mode}\nAddress: ${orderData.address}`;
+    const ownerChatId = getOwnerChatId();
+    if (ownerChatId) {
+        let summary = `📋 *New Order!*\n`;
+        summary += `🆔 ID: ${orderData.id}\n`;
+        summary += `📱 Phone: ${orderData.phone}\n`;
+        summary += `🎂 Cake: ${orderData.cake}\n`;
+        summary += `⚖️ Weight: ${orderData.weight}\n`;
+        summary += `🚚 Mode: ${orderData.mode}\n`;
+        summary += `📍 Address: ${orderData.address}\n`;
+        if (price) summary += `💰 Price: ${formatPrice(price)}\n`;
+        if (orderData.scheduledDate) summary += `📅 Scheduled: ${orderData.scheduledDate}\n`;
+        summary += `\n_Reply with "${orderData.id} ready" to notify customer_`;
         try {
             await client.sendMessage(ownerChatId, summary);
         } catch (e) {
@@ -96,35 +104,64 @@ async function finalizeOrder(phone, chatId, session) {
     }
 
     stateManager.updateState(phone, 'COMPLETED');
+    return orderData;
 }
 
-/**
- * Determine the next missing field and jump to that state.
- * If all fields are filled, go to CONFIRMING.
- */
-async function advanceToNextStep(phone, chatId, session) {
-    const d = session.data;
+// ─── Handle Owner Messages (Order Status Updates) ───
+async function handleOwnerMessage(chatId, input) {
+    // Pattern: "CAKE-XXX ready" or "CAKE-XXX done"
+    const statusMatch = input.match(/^(CAKE-\d+)\s+(ready|done|preparing|cancelled)/i);
+    if (!statusMatch) return false;
 
-    if (!d.cake) {
-        await sendButtons(chatId, 'Choose Your Cake 🎂', VALID_CAKES);
-        stateManager.updateState(phone, 'SELECTING_CAKE');
-    } else if (!d.weight) {
-        await sendButtons(chatId, 'Select Weight ⚖️', VALID_WEIGHTS);
-        stateManager.updateState(phone, 'SELECTING_WEIGHT');
-    } else if (!d.mode) {
-        await sendButtons(chatId, 'Delivery or Pickup? 🚚', VALID_MODES);
-        stateManager.updateState(phone, 'SELECTING_MODE');
-    } else if (d.mode === 'Delivery' && !d.address) {
-        await sendText(chatId, 'Delivery is between 6-8 PM.\n\nPlease share your *delivery address* using one of these methods:\n1. Tap 📎 → *Location* → share your pin 📍\n2. Send a *Google Maps* or *Apple Maps* link 🗺️\n3. Type your *full address*');
-        stateManager.updateState(phone, 'PROVIDING_ADDRESS');
+    const orderId = statusMatch[1].toUpperCase();
+    const status = statusMatch[2].charAt(0).toUpperCase() + statusMatch[2].slice(1);
+
+    console.log(`🔔 Owner update: ${orderId} → ${status}`);
+
+    const customerPhone = await sheets.updateOrderStatus(orderId, status);
+    if (customerPhone) {
+        const customerChatId = `${customerPhone}@c.us`;
+
+        const statusMessages = {
+            'Ready': `✅ *Your cake is ready!*\n\n🎂 Order ${orderId} is prepared and waiting for you.\n🏪 Pick it up at our shop!\n\nThank you for your order! 💕`,
+            'Done': `✅ *Your order is complete!*\n\n🎂 Order ${orderId} has been fulfilled.\nThank you for choosing Sweet Delights! 💕\n\n_Type "order" to place a new one!_`,
+            'Preparing': `👨‍🍳 *Your cake is being prepared!*\n\n🎂 Order ${orderId} is in the oven.\nWe'll let you know when it's ready! ⏳`,
+            'Cancelled': `❌ *Order Cancelled*\n\nOrder ${orderId} has been cancelled.\nPlease contact us if you have questions.\n\n_Type "order" to place a new one!_`
+        };
+
+        const msg = statusMessages[status] || `📋 Order ${orderId} status: *${status}*`;
+
+        try {
+            await client.sendMessage(customerChatId, msg);
+            await sendText(chatId, `✅ Customer notified about ${orderId} → ${status}`);
+            console.log(`✅ Customer ${customerPhone} notified: ${status}`);
+        } catch (e) {
+            await sendText(chatId, `❌ Failed to notify customer: ${e.message}`);
+        }
+        return true;
     } else {
-        // All fields filled — show summary for confirmation
-        await sendText(chatId, buildOrderSummary(session));
-        stateManager.updateState(phone, 'CONFIRMING');
+        await sendText(chatId, `❌ Order ${orderId} not found in records`);
+        return true;
     }
 }
 
-// ─── Message Handler ───
+// ─── Handle Custom Cake Request ───
+async function handleCustomRequest(phone, chatId, message) {
+    const ownerChatId = getOwnerChatId();
+    if (ownerChatId) {
+        let notification = `🎨 *Custom Cake Request!*\n`;
+        notification += `📱 From: ${phone}\n`;
+        notification += `💬 Request: "${message}"\n\n`;
+        notification += `_Reply directly to the customer to discuss details_`;
+        try {
+            await client.sendMessage(ownerChatId, notification);
+        } catch (e) {
+            console.error('❌ Failed to forward custom request:', e.message);
+        }
+    }
+}
+
+// ─── Main Message Handler ───
 client.on('message', async (msg) => {
     if (msg.from.includes('@g.us') || msg.from === 'status@broadcast') return;
     if (msg.fromMe) return;
@@ -139,10 +176,16 @@ client.on('message', async (msg) => {
 
     if (!input && !isLocation) return;
 
+    // ─── Owner Commands ───
+    if (isOwner(phone) && input) {
+        const handled = await handleOwnerMessage(chatId, input);
+        if (handled) return;
+    }
+
     const session = stateManager.getSession(phone);
     const state = session.state;
 
-    // Only "order" or "menu" can restart after completion
+    // Only "order" or "menu" restart after completion
     const startKeywords = ['order', 'menu'];
 
     try {
@@ -151,131 +194,219 @@ client.on('message', async (msg) => {
             if (input && startKeywords.includes(input.toLowerCase())) {
                 stateManager.clearSession(phone);
                 const newSession = stateManager.getSession(phone);
-                await sendText(chatId, '🎂 *Welcome back!*\n\nYou can type your order naturally, e.g.:\n_"I want a 1kg chocolate cake for delivery to MG Road"_\n\nOr just tell me what cake you\'d like!');
-                stateManager.updateState(phone, 'INIT');
+                // Trigger AI with a greeting
+                await processWithAI(phone, chatId, 'I want to order a cake', newSession);
             }
             return;
         }
 
-        // ─── INIT: Try Gemini AI first ───
-        if (state === 'INIT') {
-            console.log('🧠 Trying Gemini AI to parse order...');
-            const aiOrder = await parseOrder(input);
+        // ─── Handle Location Messages ───
+        if (isLocation && hasLocation) {
+            const { latitude, longitude } = msg.location;
+            const description = msg.location.description || '';
+            const address = description
+                ? `📍 ${description} (${latitude}, ${longitude})`
+                : `📍 Location: ${latitude}, ${longitude}`;
 
-            if (aiOrder) {
-                // Pre-fill whatever Gemini extracted
-                if (aiOrder.cake) stateManager.updateData(phone, 'cake', aiOrder.cake);
-                if (aiOrder.weight) stateManager.updateData(phone, 'weight', aiOrder.weight);
-                if (aiOrder.mode) stateManager.updateData(phone, 'mode', aiOrder.mode);
-                if (aiOrder.address) stateManager.updateData(phone, 'address', aiOrder.address);
+            stateManager.updateData(phone, 'address', address);
+            stateManager.addToHistory(phone, 'user', `[Shared location: ${address}]`);
 
-                const filled = [aiOrder.cake, aiOrder.weight, aiOrder.mode].filter(Boolean).length;
-                console.log(`🧠 AI extracted ${filled}/3 fields`);
-
-                if (filled > 0) {
-                    // Let user know AI understood, then advance to next missing field
-                    const updatedSession = stateManager.getSession(phone);
-                    await advanceToNextStep(phone, chatId, updatedSession);
-                    return;
-                }
-            }
-
-            // Fallback: show menu if Gemini didn't parse anything
-            await sendButtons(chatId, 'Choose Your Cake 🎂', VALID_CAKES);
-            stateManager.updateState(phone, 'SELECTING_CAKE');
-            return;
-        }
-
-        // ─── CONFIRMING: Yes/No confirmation ───
-        if (state === 'CONFIRMING') {
-            const answer = input?.toLowerCase();
-            if (answer === 'yes' || answer === 'y' || answer === 'confirm') {
-                await finalizeOrder(phone, chatId, session);
-                const modeMsg = session.data.mode === 'Delivery'
-                    ? '🚚✅ Order Confirmed for Delivery!'
-                    : '✅ Order Confirmed! Pick it up at our shop by 5:00 PM. 🏪';
-                await sendText(chatId, `${modeMsg}\n\nThank you for your order! 🙏\n_Type "order" to place a new order._`);
-            } else if (answer === 'no' || answer === 'n' || answer === 'cancel') {
-                stateManager.clearSession(phone);
-                await sendText(chatId, '❌ Order cancelled.\n_Type "order" to start a new order._');
-                stateManager.updateState(phone, 'COMPLETED');
+            // Check if order is now complete
+            const updatedSession = stateManager.getSession(phone);
+            if (updatedSession.data.cake && updatedSession.data.weight && updatedSession.data.mode) {
+                const orderData = await finalizeOrder(phone, chatId, updatedSession);
+                const price = getPrice(orderData.cake, orderData.weight);
+                let confirmation = `🚚✅ *Order Confirmed!*\n\n`;
+                confirmation += `🆔 ${orderData.id}\n`;
+                confirmation += `🎂 ${orderData.cake} (${orderData.weight})\n`;
+                confirmation += `📍 ${address}\n`;
+                if (price) confirmation += `💰 Total: ${formatPrice(price)}\n`;
+                if (orderData.scheduledDate) confirmation += `📅 ${orderData.scheduledDate}\n`;
+                confirmation += `\n🕕 Delivery between 6-8 PM\n`;
+                confirmation += `Thank you! 🙏\n_Type "order" for a new order_`;
+                await sendText(chatId, confirmation);
+                stateManager.addToHistory(phone, 'assistant', confirmation);
             } else {
-                await sendText(chatId, 'Please reply *yes* to confirm or *no* to cancel.');
+                await processWithAI(phone, chatId, `My address is ${address}`, updatedSession);
             }
             return;
         }
 
-        // ─── Step-by-step flow (for remaining fields) ───
-        switch (state) {
-            case 'SELECTING_CAKE': {
-                const choice = parseInt(input);
-                if (choice >= 1 && choice <= VALID_CAKES.length) {
-                    stateManager.updateData(phone, 'cake', VALID_CAKES[choice - 1]);
-                    await advanceToNextStep(phone, chatId, stateManager.getSession(phone));
-                } else {
-                    await sendText(chatId, 'Please reply with a number (1-3)');
-                }
-                break;
+        // ─── Maps Link Detection ───
+        if (input && (input.includes('maps.google') || input.includes('goo.gl/maps') ||
+            input.includes('google.com/maps') || input.includes('maps.apple.com'))) {
+            const address = `🗺️ Maps: ${input}`;
+            stateManager.updateData(phone, 'address', address);
+            stateManager.addToHistory(phone, 'user', `[Shared maps link: ${input}]`);
+
+            const updatedSession = stateManager.getSession(phone);
+            if (updatedSession.data.cake && updatedSession.data.weight && updatedSession.data.mode) {
+                const orderData = await finalizeOrder(phone, chatId, updatedSession);
+                const price = getPrice(orderData.cake, orderData.weight);
+                let confirmation = `🚚✅ *Order Confirmed!*\n\n`;
+                confirmation += `🆔 ${orderData.id}\n`;
+                confirmation += `🎂 ${orderData.cake} (${orderData.weight})\n`;
+                confirmation += `📍 ${address}\n`;
+                if (price) confirmation += `💰 Total: ${formatPrice(price)}\n`;
+                confirmation += `\nThank you! 🙏\n_Type "order" for a new order_`;
+                await sendText(chatId, confirmation);
+            } else {
+                await processWithAI(phone, chatId, `My address is ${address}`, updatedSession);
             }
-
-            case 'SELECTING_WEIGHT': {
-                const choice = parseInt(input);
-                if (choice >= 1 && choice <= VALID_WEIGHTS.length) {
-                    stateManager.updateData(phone, 'weight', VALID_WEIGHTS[choice - 1]);
-                    await advanceToNextStep(phone, chatId, stateManager.getSession(phone));
-                } else {
-                    await sendText(chatId, 'Please reply with a number (1-3)');
-                }
-                break;
-            }
-
-            case 'SELECTING_MODE': {
-                const choice = parseInt(input);
-                if (choice >= 1 && choice <= VALID_MODES.length) {
-                    stateManager.updateData(phone, 'mode', VALID_MODES[choice - 1]);
-                    await advanceToNextStep(phone, chatId, stateManager.getSession(phone));
-                } else {
-                    await sendText(chatId, 'Please reply with 1 or 2');
-                }
-                break;
-            }
-
-            case 'PROVIDING_ADDRESS': {
-                let address = null;
-
-                if (isLocation && hasLocation) {
-                    const { latitude, longitude } = msg.location;
-                    const description = msg.location.description || '';
-                    address = description
-                        ? `📍 ${description} (${latitude}, ${longitude})`
-                        : `📍 Location: ${latitude}, ${longitude}`;
-                } else if (input && (input.includes('maps.google') || input.includes('goo.gl/maps') || input.includes('google.com/maps'))) {
-                    address = `🗺️ Google Maps: ${input}`;
-                } else if (input && input.includes('maps.apple.com')) {
-                    address = `🗺️ Apple Maps: ${input}`;
-                } else if (input && input.length >= 5 && /[a-zA-Z]/.test(input)) {
-                    address = input;
-                }
-
-                if (address) {
-                    stateManager.updateData(phone, 'address', address);
-                    await advanceToNextStep(phone, chatId, stateManager.getSession(phone));
-                } else {
-                    await sendText(chatId, '⚠️ Please share a valid location:\n\n1. Tap 📎 → *Location* → share your location\n2. Or paste a *Google Maps* / *Apple Maps* link\n3. Or type your full address (min 5 characters)');
-                }
-                break;
-            }
-
-            default:
-                stateManager.clearSession(phone);
-                await sendText(chatId, '🎂 *Welcome!*\n\nYou can type your order naturally, e.g.:\n_"I want a 1kg chocolate cake for delivery to MG Road"_\n\nOr just tell me what cake you\'d like!');
-                stateManager.updateState(phone, 'INIT');
-                break;
+            return;
         }
+
+        // ─── Process everything through AI ───
+        await processWithAI(phone, chatId, input, session);
+
     } catch (err) {
         console.error('❌ Error processing message:', err);
     }
 });
+
+// ─── AI Processing Core ───
+async function processWithAI(phone, chatId, input, session) {
+    // Fetch last order for repeat functionality
+    let lastOrder = null;
+    try {
+        lastOrder = await sheets.getLastOrder(phone);
+    } catch (e) {
+        console.log('⚠️ Could not fetch last order');
+    }
+
+    // Call AI
+    const result = await ai.chat(input, session.data, session.history, lastOrder);
+
+    if (!result) {
+        // AI unavailable — fallback to basic prompt
+        await sendText(chatId, '🎂 Welcome to Sweet Delights Bakery!\n\nTell me what cake you\'d like, or type "menu" to see our options!\n\nExample: _"I want a 1kg chocolate cake for delivery"_');
+        stateManager.updateState(phone, 'ORDERING');
+        return;
+    }
+
+    // Track conversation
+    stateManager.addToHistory(phone, 'user', input);
+
+    console.log(`🧠 AI type: ${result.type}, updates:`, result.updates);
+
+    // Apply any extracted order data
+    if (result.updates) {
+        if (result.updates.cake) stateManager.updateData(phone, 'cake', result.updates.cake);
+        if (result.updates.weight) stateManager.updateData(phone, 'weight', result.updates.weight);
+        if (result.updates.mode) stateManager.updateData(phone, 'mode', result.updates.mode);
+        if (result.updates.address) stateManager.updateData(phone, 'address', result.updates.address);
+        if (result.updates.scheduledDate) stateManager.updateData(phone, 'scheduledDate', result.updates.scheduledDate);
+    }
+
+    // Handle different AI response types
+    switch (result.type) {
+        case 'complete': {
+            // Order is complete — finalize!
+            const updatedSession = stateManager.getSession(phone);
+            const d = updatedSession.data;
+
+            // Verify we have minimum required fields
+            if (!d.cake || !d.weight || !d.mode) {
+                // AI said complete but fields are missing — send its response and continue
+                await sendText(chatId, result.response);
+                stateManager.addToHistory(phone, 'assistant', result.response);
+                stateManager.updateState(phone, 'ORDERING');
+                break;
+            }
+
+            // If delivery mode requires address
+            if (d.mode === 'Delivery' && !d.address) {
+                await sendText(chatId, result.response);
+                stateManager.addToHistory(phone, 'assistant', result.response);
+                stateManager.updateState(phone, 'ORDERING');
+                break;
+            }
+
+            const orderData = await finalizeOrder(phone, chatId, updatedSession);
+            const price = getPrice(d.cake, d.weight);
+
+            let confirmation = `✅ *Order Confirmed!*\n\n`;
+            confirmation += `🆔 ${orderData.id}\n`;
+            confirmation += `🎂 ${d.cake} (${d.weight})\n`;
+            confirmation += `🚚 ${d.mode}`;
+            if (d.mode === 'Delivery') {
+                confirmation += `\n📍 ${d.address}`;
+                confirmation += `\n🕕 Delivery between 6-8 PM`;
+            } else {
+                confirmation += `\n🏪 Pick up by 5 PM`;
+            }
+            if (price) confirmation += `\n💰 Total: *${formatPrice(price)}*`;
+            if (d.scheduledDate) confirmation += `\n📅 Scheduled: ${d.scheduledDate}`;
+            confirmation += `\n\nThank you for choosing Sweet Delights! 🙏💕`;
+            confirmation += `\n_Type "order" to place a new order_`;
+
+            await sendText(chatId, confirmation);
+            stateManager.addToHistory(phone, 'assistant', confirmation);
+            break;
+        }
+
+        case 'custom_request': {
+            // Forward to owner
+            await handleCustomRequest(phone, chatId, input);
+            await sendText(chatId, result.response);
+            stateManager.addToHistory(phone, 'assistant', result.response);
+            stateManager.updateState(phone, 'COMPLETED');
+            break;
+        }
+
+        case 'repeat_order': {
+            // Fill from last order data
+            if (lastOrder) {
+                stateManager.updateData(phone, 'cake', lastOrder.cake);
+                stateManager.updateData(phone, 'weight', lastOrder.weight);
+                stateManager.updateData(phone, 'mode', lastOrder.mode);
+                if (lastOrder.address) stateManager.updateData(phone, 'address', lastOrder.address);
+
+                await sendText(chatId, result.response);
+                stateManager.addToHistory(phone, 'assistant', result.response);
+
+                // Check if the repeated order is complete
+                const updatedSession = stateManager.getSession(phone);
+                const d = updatedSession.data;
+                if (d.cake && d.weight && d.mode && (d.mode !== 'Delivery' || d.address)) {
+                    const orderData = await finalizeOrder(phone, chatId, updatedSession);
+                    const price = getPrice(d.cake, d.weight);
+                    let confirmation = `✅ *Repeat Order Confirmed!*\n\n`;
+                    confirmation += `🆔 ${orderData.id}\n`;
+                    confirmation += `🎂 ${d.cake} (${d.weight})\n`;
+                    confirmation += `🚚 ${d.mode}\n`;
+                    if (d.address && d.address !== 'Pickup') confirmation += `📍 ${d.address}\n`;
+                    if (price) confirmation += `💰 Total: *${formatPrice(price)}*\n`;
+                    confirmation += `\nThank you! 🙏💕\n_Type "order" for a new order_`;
+                    await sendText(chatId, confirmation);
+                    stateManager.addToHistory(phone, 'assistant', confirmation);
+                } else {
+                    stateManager.updateState(phone, 'ORDERING');
+                }
+            } else {
+                await sendText(chatId, result.response);
+                stateManager.addToHistory(phone, 'assistant', result.response);
+                stateManager.updateState(phone, 'ORDERING');
+            }
+            break;
+        }
+
+        case 'cancel': {
+            stateManager.clearSession(phone);
+            await sendText(chatId, result.response);
+            stateManager.updateState(phone, 'COMPLETED');
+            break;
+        }
+
+        default: {
+            // greeting, collecting, unknown — send AI response and continue
+            await sendText(chatId, result.response);
+            stateManager.addToHistory(phone, 'assistant', result.response);
+            stateManager.updateState(phone, 'ORDERING');
+            break;
+        }
+    }
+}
 
 // ─── Error Handling ───
 client.on('auth_failure', (msg) => {

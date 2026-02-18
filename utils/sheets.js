@@ -14,10 +14,9 @@ async function getAuthClient() {
         throw new Error('Missing GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_PRIVATE_KEY');
     }
 
-    // Replace literal \n with actual newline characters (if any remain)
     key = key.replace(/\\n/g, '\n');
 
-    // googleapis v171+ requires named params (positional args no longer work)
+    // googleapis v171+ requires named params
     const auth = new google.auth.JWT({
         email: email,
         key: key,
@@ -48,14 +47,17 @@ async function appendOrder(orderData) {
                 orderData.cake,
                 orderData.weight,
                 orderData.mode,
-                orderData.address
+                orderData.address,
+                orderData.price || '',
+                orderData.scheduledDate || '',
+                orderData.status || 'New'
             ]
         ],
     };
 
     await sheets.spreadsheets.values.append({
         spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: 'Sheet1!A:G',
+        range: 'Sheet1!A:J',
         valueInputOption: 'USER_ENTERED',
         resource,
     });
@@ -63,6 +65,90 @@ async function appendOrder(orderData) {
     console.log('✅ Order saved to Google Sheets');
 }
 
+/**
+ * Get the last order for a phone number (for repeat orders)
+ */
+async function getLastOrder(phone) {
+    if (!process.env.GOOGLE_SHEET_ID) return null;
+
+    try {
+        const auth = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth });
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: process.env.GOOGLE_SHEET_ID,
+            range: 'Sheet1!A:J',
+        });
+
+        const rows = response.data.values || [];
+
+        // Find the last order from this phone number (search from bottom)
+        for (let i = rows.length - 1; i >= 0; i--) {
+            const row = rows[i];
+            // Column C (index 2) = phone number
+            if (row[2] && row[2].includes(phone.replace('91', ''))) {
+                return {
+                    id: row[0],
+                    date: row[1],
+                    phone: row[2],
+                    cake: row[3],
+                    weight: row[4],
+                    mode: row[5],
+                    address: row[6],
+                    price: row[7],
+                    scheduledDate: row[8]
+                };
+            }
+        }
+
+        return null;
+    } catch (e) {
+        console.error('❌ Failed to read sheets:', e.message);
+        return null;
+    }
+}
+
+/**
+ * Update order status in Google Sheets
+ */
+async function updateOrderStatus(orderId, status) {
+    if (!process.env.GOOGLE_SHEET_ID) return false;
+
+    try {
+        const auth = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth });
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: process.env.GOOGLE_SHEET_ID,
+            range: 'Sheet1!A:J',
+        });
+
+        const rows = response.data.values || [];
+
+        // Find the row with this order ID
+        for (let i = 0; i < rows.length; i++) {
+            if (rows[i][0] === orderId) {
+                // Update status column (J = column 10)
+                await sheets.spreadsheets.values.update({
+                    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+                    range: `Sheet1!J${i + 1}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [[status]] }
+                });
+                // Return the phone number for notification
+                return rows[i][2];
+            }
+        }
+
+        return null;
+    } catch (e) {
+        console.error('❌ Failed to update order status:', e.message);
+        return null;
+    }
+}
+
 module.exports = {
-    appendOrder
+    appendOrder,
+    getLastOrder,
+    updateOrderStatus
 };
