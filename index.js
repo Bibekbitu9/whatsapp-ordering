@@ -5,7 +5,8 @@ require('dotenv').config();
 const stateManager = require('./state_manager');
 const sheets = require('./utils/sheets');
 const ai = require('./ai');
-const { getPrice, formatPrice, VALID_CAKES, VALID_WEIGHTS, VALID_MODES } = require('./utils/pricing');
+const store = require('./store_config');
+const ownerPortal = require('./owner_portal');
 
 // ─── Initialize WhatsApp Client ───
 const client = new Client({
@@ -28,9 +29,8 @@ client.on('authenticated', () => {
 
 client.on('ready', () => {
     console.log('🤖 Bot is ready and listening for messages!');
-    console.log(`📋 Menu: ${VALID_CAKES.join(', ')}`);
-    console.log(`⚖️  Weights: ${VALID_WEIGHTS.join(', ')}`);
-    console.log(`🚚 Modes: ${VALID_MODES.join(', ')}`);
+    console.log(`🏪 Store: ${store.getShopName()} — ${store.isOpen() ? '🟢 OPEN' : '🔴 CLOSED'}`);
+    console.log(`📋 Available cakes: ${store.getAvailableCakes().join(', ')}`);
 });
 
 // ─── Helpers ───
@@ -58,7 +58,7 @@ function isOwner(phone) {
 
 // ─── Order Finalization ───
 async function finalizeOrder(phone, chatId, session) {
-    const price = getPrice(session.data.cake, session.data.weight);
+    const price = store.getPrice(session.data.cake, session.data.weight);
 
     const orderData = {
         id: session.data.orderId || generateOrderId(),
@@ -67,7 +67,7 @@ async function finalizeOrder(phone, chatId, session) {
         weight: session.data.weight,
         mode: session.data.mode,
         address: session.data.address || 'Pickup',
-        price: price ? formatPrice(price) : '',
+        price: price ? `₹${price}` : '',
         scheduledDate: session.data.scheduledDate || '',
         date: new Date().toISOString(),
         status: 'New'
@@ -75,7 +75,6 @@ async function finalizeOrder(phone, chatId, session) {
 
     console.log('📦 Finalizing Order:', orderData);
 
-    // Save to Google Sheets
     try {
         await sheets.appendOrder(orderData);
         console.log('✅ Saved to Google Sheets');
@@ -83,23 +82,31 @@ async function finalizeOrder(phone, chatId, session) {
         console.error('❌ Failed to save to sheets:', e.message);
     }
 
-    // Notify Owner
+    // Notify Owner (via terminal always, via WhatsApp only if owner ≠ bot's own number)
+    let summary = `📋 New Order: ${orderData.id} | ${orderData.cake} ${orderData.weight} | ${orderData.mode} | ${orderData.address}`;
+    if (price) summary += ` | ₹${price}`;
+    console.log(`\n🔔 ${summary}`);
+
     const ownerChatId = getOwnerChatId();
-    if (ownerChatId) {
-        let summary = `📋 *New Order!*\n`;
-        summary += `🆔 ID: ${orderData.id}\n`;
-        summary += `📱 Phone: ${orderData.phone}\n`;
-        summary += `🎂 Cake: ${orderData.cake}\n`;
-        summary += `⚖️ Weight: ${orderData.weight}\n`;
-        summary += `🚚 Mode: ${orderData.mode}\n`;
-        summary += `📍 Address: ${orderData.address}\n`;
-        if (price) summary += `💰 Price: ${formatPrice(price)}\n`;
-        if (orderData.scheduledDate) summary += `📅 Scheduled: ${orderData.scheduledDate}\n`;
-        summary += `\n_Reply with "${orderData.id} ready" to notify customer_`;
+    const botNumber = client.info?.wid?.user;
+    const ownerNum = process.env.OWNER_NUMBER?.replace(/\D/g, '');
+    const isBotOwner = botNumber && ownerNum && (botNumber.includes(ownerNum) || ownerNum.includes(botNumber));
+
+    if (ownerChatId && !isBotOwner && chatId !== ownerChatId) {
+        let ownerMsg = `📋 *New Order!*\n`;
+        ownerMsg += `🆔 ID: ${orderData.id}\n`;
+        ownerMsg += `📱 Phone: ${orderData.phone}\n`;
+        ownerMsg += `🎂 Cake: ${orderData.cake}\n`;
+        ownerMsg += `⚖️ Weight: ${orderData.weight}\n`;
+        ownerMsg += `🚚 Mode: ${orderData.mode}\n`;
+        ownerMsg += `📍 Address: ${orderData.address}\n`;
+        if (price) ownerMsg += `💰 Price: ₹${price}\n`;
+        if (orderData.scheduledDate) ownerMsg += `📅 Scheduled: ${orderData.scheduledDate}\n`;
+        ownerMsg += `\n_Reply "${orderData.id} ready" to notify customer_`;
         try {
-            await client.sendMessage(ownerChatId, summary);
+            await client.sendMessage(ownerChatId, ownerMsg);
         } catch (e) {
-            console.error('❌ Failed to notify owner:', e.message);
+            console.error('❌ Failed to notify owner via WhatsApp:', e.message);
         }
     }
 
@@ -107,52 +114,20 @@ async function finalizeOrder(phone, chatId, session) {
     return orderData;
 }
 
-// ─── Handle Owner Messages (Order Status Updates) ───
-async function handleOwnerMessage(chatId, input) {
-    // Pattern: "CAKE-XXX ready" or "CAKE-XXX done"
-    const statusMatch = input.match(/^(CAKE-\d+)\s+(ready|done|preparing|cancelled)/i);
-    if (!statusMatch) return false;
-
-    const orderId = statusMatch[1].toUpperCase();
-    const status = statusMatch[2].charAt(0).toUpperCase() + statusMatch[2].slice(1);
-
-    console.log(`🔔 Owner update: ${orderId} → ${status}`);
-
-    const customerPhone = await sheets.updateOrderStatus(orderId, status);
-    if (customerPhone) {
-        const customerChatId = `${customerPhone}@c.us`;
-
-        const statusMessages = {
-            'Ready': `✅ *Your cake is ready!*\n\n🎂 Order ${orderId} is prepared and waiting for you.\n🏪 Pick it up at our shop!\n\nThank you for your order! 💕`,
-            'Done': `✅ *Your order is complete!*\n\n🎂 Order ${orderId} has been fulfilled.\nThank you for choosing Sweet Delights! 💕\n\n_Type "order" to place a new one!_`,
-            'Preparing': `👨‍🍳 *Your cake is being prepared!*\n\n🎂 Order ${orderId} is in the oven.\nWe'll let you know when it's ready! ⏳`,
-            'Cancelled': `❌ *Order Cancelled*\n\nOrder ${orderId} has been cancelled.\nPlease contact us if you have questions.\n\n_Type "order" to place a new one!_`
-        };
-
-        const msg = statusMessages[status] || `📋 Order ${orderId} status: *${status}*`;
-
-        try {
-            await client.sendMessage(customerChatId, msg);
-            await sendText(chatId, `✅ Customer notified about ${orderId} → ${status}`);
-            console.log(`✅ Customer ${customerPhone} notified: ${status}`);
-        } catch (e) {
-            await sendText(chatId, `❌ Failed to notify customer: ${e.message}`);
-        }
-        return true;
-    } else {
-        await sendText(chatId, `❌ Order ${orderId} not found in records`);
-        return true;
-    }
-}
-
 // ─── Handle Custom Cake Request ───
 async function handleCustomRequest(phone, chatId, message) {
+    console.log(`🎨 Custom Cake Request from ${phone}: ${message}`);
+
     const ownerChatId = getOwnerChatId();
-    if (ownerChatId) {
+    const botNumber = client.info?.wid?.user;
+    const ownerNum = process.env.OWNER_NUMBER?.replace(/\D/g, '');
+    const isBotOwner = botNumber && ownerNum && (botNumber.includes(ownerNum) || ownerNum.includes(botNumber));
+
+    if (ownerChatId && !isBotOwner && chatId !== ownerChatId) {
         let notification = `🎨 *Custom Cake Request!*\n`;
         notification += `📱 From: ${phone}\n`;
         notification += `💬 Request: "${message}"\n\n`;
-        notification += `_Reply directly to the customer to discuss details_`;
+        notification += `_Reply directly to discuss details_`;
         try {
             await client.sendMessage(ownerChatId, notification);
         } catch (e) {
@@ -176,25 +151,85 @@ client.on('message', async (msg) => {
 
     if (!input && !isLocation) return;
 
-    // ─── Owner Commands ───
+    // ═════════════════════════════════════════
+    // ─── OWNER PORTAL ───
+    // ═════════════════════════════════════════
     if (isOwner(phone) && input) {
-        const handled = await handleOwnerMessage(chatId, input);
-        if (handled) return;
+        try {
+            const portalResponse = await ownerPortal.handleOwnerMessage(phone, input);
+
+            if (portalResponse !== null && portalResponse !== undefined) {
+                // Handle special response types
+                if (typeof portalResponse === 'object') {
+                    if (portalResponse.type === 'status_update') {
+                        // Order status update — notify customer
+                        const customerChatId = `${portalResponse.phone}@c.us`;
+                        const statusMessages = {
+                            'Ready': `✅ *Your cake is ready!*\n\n🎂 Order ${portalResponse.orderId} is prepared.\n🏪 Pick it up at our shop!\n\nThank you! 💕`,
+                            'Done': `✅ *Your order is complete!*\n\n🎂 Order ${portalResponse.orderId} has been fulfilled.\nThank you for choosing ${store.getShopName()}! 💕\n\n_Type "order" for a new one!_`,
+                            'Preparing': `👨‍🍳 *Your cake is being prepared!*\n\n🎂 Order ${portalResponse.orderId} is in the oven.\nWe'll let you know when it's ready! ⏳`,
+                            'Cancelled': `❌ *Order Cancelled*\n\nOrder ${portalResponse.orderId} has been cancelled.\n\n_Type "order" for a new one!_`
+                        };
+                        const msg = statusMessages[portalResponse.status] || `📋 Order ${portalResponse.orderId}: *${portalResponse.status}*`;
+                        try {
+                            await client.sendMessage(customerChatId, msg);
+                            await sendText(chatId, `✅ Customer notified: ${portalResponse.orderId} → ${portalResponse.status}`);
+                        } catch (e) {
+                            await sendText(chatId, `❌ Failed to notify customer: ${e.message}`);
+                        }
+                        return;
+                    }
+
+                    if (portalResponse.type === 'broadcast') {
+                        // Broadcast to recent customers
+                        try {
+                            const recentOrders = await sheets.getTodaysOrders();
+                            const phones = [...new Set(recentOrders.map(o => o.phone))];
+                            let sent = 0;
+                            for (const p of phones) {
+                                try {
+                                    await client.sendMessage(`${p}@c.us`, portalResponse.message);
+                                    sent++;
+                                } catch (e) { /* skip failed */ }
+                            }
+                            await sendText(chatId, `✅ Broadcast sent to ${sent} customer(s)\n\n` + ownerPortal.handleOwnerMessage.__proto__); // Will fall through
+                            await sendText(chatId, `📢 Broadcast sent to *${sent}* customer(s)`);
+                        } catch (e) {
+                            await sendText(chatId, `❌ Broadcast failed: ${e.message}`);
+                        }
+                        return;
+                    }
+                }
+
+                // Regular text response from portal
+                await sendText(chatId, portalResponse);
+                return;
+            }
+        } catch (e) {
+            console.error('❌ Owner portal error:', e.message);
+        }
+    }
+
+    // ═════════════════════════════════════════
+    // ─── CUSTOMER FLOW ───
+    // ═════════════════════════════════════════
+
+    // Check if store is closed
+    if (!store.isOpen()) {
+        await sendText(chatId, store.getClosedMessage());
+        return;
     }
 
     const session = stateManager.getSession(phone);
     const state = session.state;
-
-    // Only "order" or "menu" restart after completion
     const startKeywords = ['order', 'menu'];
 
     try {
-        // ─── COMPLETED: Ignore everything except restart keywords ───
+        // ─── COMPLETED: Only restart on keywords ───
         if (state === 'COMPLETED') {
             if (input && startKeywords.includes(input.toLowerCase())) {
                 stateManager.clearSession(phone);
                 const newSession = stateManager.getSession(phone);
-                // Trigger AI with a greeting
                 await processWithAI(phone, chatId, 'I want to order a cake', newSession);
             }
             return;
@@ -211,21 +246,18 @@ client.on('message', async (msg) => {
             stateManager.updateData(phone, 'address', address);
             stateManager.addToHistory(phone, 'user', `[Shared location: ${address}]`);
 
-            // Check if order is now complete
             const updatedSession = stateManager.getSession(phone);
             if (updatedSession.data.cake && updatedSession.data.weight && updatedSession.data.mode) {
                 const orderData = await finalizeOrder(phone, chatId, updatedSession);
-                const price = getPrice(orderData.cake, orderData.weight);
+                const price = store.getPrice(orderData.cake, orderData.weight);
                 let confirmation = `🚚✅ *Order Confirmed!*\n\n`;
                 confirmation += `🆔 ${orderData.id}\n`;
                 confirmation += `🎂 ${orderData.cake} (${orderData.weight})\n`;
                 confirmation += `📍 ${address}\n`;
-                if (price) confirmation += `💰 Total: ${formatPrice(price)}\n`;
-                if (orderData.scheduledDate) confirmation += `📅 ${orderData.scheduledDate}\n`;
-                confirmation += `\n🕕 Delivery between 6-8 PM\n`;
+                if (price) confirmation += `💰 Total: ₹${price}\n`;
+                confirmation += `\n🕕 Delivery: ${store.getDeliveryHours()}\n`;
                 confirmation += `Thank you! 🙏\n_Type "order" for a new order_`;
                 await sendText(chatId, confirmation);
-                stateManager.addToHistory(phone, 'assistant', confirmation);
             } else {
                 await processWithAI(phone, chatId, `My address is ${address}`, updatedSession);
             }
@@ -237,17 +269,16 @@ client.on('message', async (msg) => {
             input.includes('google.com/maps') || input.includes('maps.apple.com'))) {
             const address = `🗺️ Maps: ${input}`;
             stateManager.updateData(phone, 'address', address);
-            stateManager.addToHistory(phone, 'user', `[Shared maps link: ${input}]`);
 
             const updatedSession = stateManager.getSession(phone);
             if (updatedSession.data.cake && updatedSession.data.weight && updatedSession.data.mode) {
                 const orderData = await finalizeOrder(phone, chatId, updatedSession);
-                const price = getPrice(orderData.cake, orderData.weight);
+                const price = store.getPrice(orderData.cake, orderData.weight);
                 let confirmation = `🚚✅ *Order Confirmed!*\n\n`;
                 confirmation += `🆔 ${orderData.id}\n`;
                 confirmation += `🎂 ${orderData.cake} (${orderData.weight})\n`;
                 confirmation += `📍 ${address}\n`;
-                if (price) confirmation += `💰 Total: ${formatPrice(price)}\n`;
+                if (price) confirmation += `💰 Total: ₹${price}\n`;
                 confirmation += `\nThank you! 🙏\n_Type "order" for a new order_`;
                 await sendText(chatId, confirmation);
             } else {
@@ -264,9 +295,8 @@ client.on('message', async (msg) => {
     }
 });
 
-// ─── AI Processing Core ───
+// ─── AI Processing ───
 async function processWithAI(phone, chatId, input, session) {
-    // Fetch last order for repeat functionality
     let lastOrder = null;
     try {
         lastOrder = await sheets.getLastOrder(phone);
@@ -274,22 +304,19 @@ async function processWithAI(phone, chatId, input, session) {
         console.log('⚠️ Could not fetch last order');
     }
 
-    // Call AI
     const result = await ai.chat(input, session.data, session.history, lastOrder);
 
     if (!result) {
-        // AI unavailable — fallback to basic prompt
-        await sendText(chatId, '🎂 Welcome to Sweet Delights Bakery!\n\nTell me what cake you\'d like, or type "menu" to see our options!\n\nExample: _"I want a 1kg chocolate cake for delivery"_');
+        const menuText = store.getMenuText();
+        await sendText(chatId, `🎂 Welcome to ${store.getShopName()}!\n\n${menuText}\n\nTell me what you'd like, or describe your order naturally!\n_Example: "I want a 1kg chocolate cake for delivery"_`);
         stateManager.updateState(phone, 'ORDERING');
         return;
     }
 
-    // Track conversation
     stateManager.addToHistory(phone, 'user', input);
-
     console.log(`🧠 AI type: ${result.type}, updates:`, result.updates);
 
-    // Apply any extracted order data
+    // Apply updates
     if (result.updates) {
         if (result.updates.cake) stateManager.updateData(phone, 'cake', result.updates.cake);
         if (result.updates.weight) stateManager.updateData(phone, 'weight', result.updates.weight);
@@ -298,23 +325,18 @@ async function processWithAI(phone, chatId, input, session) {
         if (result.updates.scheduledDate) stateManager.updateData(phone, 'scheduledDate', result.updates.scheduledDate);
     }
 
-    // Handle different AI response types
     switch (result.type) {
         case 'complete': {
-            // Order is complete — finalize!
-            const updatedSession = stateManager.getSession(phone);
-            const d = updatedSession.data;
+            const s = stateManager.getSession(phone);
+            const d = s.data;
 
-            // Verify we have minimum required fields
             if (!d.cake || !d.weight || !d.mode) {
-                // AI said complete but fields are missing — send its response and continue
                 await sendText(chatId, result.response);
                 stateManager.addToHistory(phone, 'assistant', result.response);
                 stateManager.updateState(phone, 'ORDERING');
                 break;
             }
 
-            // If delivery mode requires address
             if (d.mode === 'Delivery' && !d.address) {
                 await sendText(chatId, result.response);
                 stateManager.addToHistory(phone, 'assistant', result.response);
@@ -322,8 +344,8 @@ async function processWithAI(phone, chatId, input, session) {
                 break;
             }
 
-            const orderData = await finalizeOrder(phone, chatId, updatedSession);
-            const price = getPrice(d.cake, d.weight);
+            const orderData = await finalizeOrder(phone, chatId, s);
+            const price = store.getPrice(d.cake, d.weight);
 
             let confirmation = `✅ *Order Confirmed!*\n\n`;
             confirmation += `🆔 ${orderData.id}\n`;
@@ -331,13 +353,13 @@ async function processWithAI(phone, chatId, input, session) {
             confirmation += `🚚 ${d.mode}`;
             if (d.mode === 'Delivery') {
                 confirmation += `\n📍 ${d.address}`;
-                confirmation += `\n🕕 Delivery between 6-8 PM`;
+                confirmation += `\n🕕 Delivery: ${store.getDeliveryHours()}`;
             } else {
-                confirmation += `\n🏪 Pick up by 5 PM`;
+                confirmation += `\n🏪 Pick up by ${store.getPickupDeadline()}`;
             }
-            if (price) confirmation += `\n💰 Total: *${formatPrice(price)}*`;
+            if (price) confirmation += `\n💰 Total: *₹${price}*`;
             if (d.scheduledDate) confirmation += `\n📅 Scheduled: ${d.scheduledDate}`;
-            confirmation += `\n\nThank you for choosing Sweet Delights! 🙏💕`;
+            confirmation += `\n\nThank you for choosing ${store.getShopName()}! 🙏💕`;
             confirmation += `\n_Type "order" to place a new order_`;
 
             await sendText(chatId, confirmation);
@@ -346,7 +368,6 @@ async function processWithAI(phone, chatId, input, session) {
         }
 
         case 'custom_request': {
-            // Forward to owner
             await handleCustomRequest(phone, chatId, input);
             await sendText(chatId, result.response);
             stateManager.addToHistory(phone, 'assistant', result.response);
@@ -355,7 +376,6 @@ async function processWithAI(phone, chatId, input, session) {
         }
 
         case 'repeat_order': {
-            // Fill from last order data
             if (lastOrder) {
                 stateManager.updateData(phone, 'cake', lastOrder.cake);
                 stateManager.updateData(phone, 'weight', lastOrder.weight);
@@ -365,21 +385,18 @@ async function processWithAI(phone, chatId, input, session) {
                 await sendText(chatId, result.response);
                 stateManager.addToHistory(phone, 'assistant', result.response);
 
-                // Check if the repeated order is complete
-                const updatedSession = stateManager.getSession(phone);
-                const d = updatedSession.data;
+                const s = stateManager.getSession(phone);
+                const d = s.data;
                 if (d.cake && d.weight && d.mode && (d.mode !== 'Delivery' || d.address)) {
-                    const orderData = await finalizeOrder(phone, chatId, updatedSession);
-                    const price = getPrice(d.cake, d.weight);
-                    let confirmation = `✅ *Repeat Order Confirmed!*\n\n`;
-                    confirmation += `🆔 ${orderData.id}\n`;
-                    confirmation += `🎂 ${d.cake} (${d.weight})\n`;
-                    confirmation += `🚚 ${d.mode}\n`;
-                    if (d.address && d.address !== 'Pickup') confirmation += `📍 ${d.address}\n`;
-                    if (price) confirmation += `💰 Total: *${formatPrice(price)}*\n`;
-                    confirmation += `\nThank you! 🙏💕\n_Type "order" for a new order_`;
-                    await sendText(chatId, confirmation);
-                    stateManager.addToHistory(phone, 'assistant', confirmation);
+                    const orderData = await finalizeOrder(phone, chatId, s);
+                    const price = store.getPrice(d.cake, d.weight);
+                    let c = `✅ *Repeat Order Confirmed!*\n\n`;
+                    c += `🆔 ${orderData.id}\n`;
+                    c += `🎂 ${d.cake} (${d.weight}) | ${d.mode}\n`;
+                    if (d.address && d.address !== 'Pickup') c += `📍 ${d.address}\n`;
+                    if (price) c += `💰 Total: *₹${price}*\n`;
+                    c += `\nThank you! 🙏💕\n_Type "order" for a new order_`;
+                    await sendText(chatId, c);
                 } else {
                     stateManager.updateState(phone, 'ORDERING');
                 }
@@ -399,7 +416,6 @@ async function processWithAI(phone, chatId, input, session) {
         }
 
         default: {
-            // greeting, collecting, unknown — send AI response and continue
             await sendText(chatId, result.response);
             stateManager.addToHistory(phone, 'assistant', result.response);
             stateManager.updateState(phone, 'ORDERING');

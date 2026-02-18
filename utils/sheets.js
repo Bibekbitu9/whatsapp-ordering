@@ -147,8 +147,49 @@ async function updateOrderStatus(orderId, status) {
     }
 }
 
+/**
+ * Get today's orders (for owner portal)
+ */
+async function getTodaysOrders() {
+    if (!process.env.GOOGLE_SHEET_ID) return [];
+
+    try {
+        const auth = await getAuthClient();
+        const sheetsApi = google.sheets({ version: 'v4', auth });
+
+        const response = await sheetsApi.spreadsheets.values.get({
+            spreadsheetId: process.env.GOOGLE_SHEET_ID,
+            range: 'Sheet1!A:J',
+        });
+
+        const rows = response.data.values || [];
+        const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+
+        return rows.filter(row => {
+            // Column B (index 1) = date
+            if (!row[1]) return false;
+            return row[1].startsWith(today);
+        }).map(row => ({
+            id: row[0],
+            date: row[1],
+            phone: row[2],
+            cake: row[3],
+            weight: row[4],
+            mode: row[5],
+            address: row[6],
+            price: row[7],
+            scheduledDate: row[8],
+            status: row[9] || 'New'
+        }));
+    } catch (e) {
+        console.error('❌ Failed to get orders:', e.message);
+        return [];
+    }
+}
+
 module.exports = {
     appendOrder,
     getLastOrder,
-    updateOrderStatus
+    updateOrderStatus,
+    getTodaysOrders
 };

@@ -1,5 +1,6 @@
 node_modules/
 .env
+store_data.json
 .wwebjs_auth/
 .wwebjs_cache/
 debug.log
