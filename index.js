@@ -103,6 +103,9 @@ client.on('message_create', async (msg) => {
     if (!msg.fromMe) return;
     if (msg.from.includes('@g.us') || msg.from === 'status@broadcast') return;
 
+    // RESTRICTION: Only process owner portal for self-chats (messages sent TO the owner number)
+    if (msg.to !== getOwnerChatId()) return;
+
     // Prevent infinite loop: skip if we're already processing an owner command
     if (isProcessingOwner) return;
 
@@ -186,8 +189,45 @@ client.on('message', async (msg) => {
 
     const session = stateManager.getSession(phone);
     const state = session.state;
+    const lowerInput = input ? input.toLowerCase() : '';
 
     try {
+        // ─── Interaction Menu Interceptor ───
+        if (lowerInput === 'hi' || lowerInput === 'hello' || lowerInput === 'hey') {
+            stateManager.updateState(phone, 'START_MENU');
+            await sendText(chatId, `🎂 Welcome to *${store.getShopName()}*! How can I help you today?\n\n1️⃣ *Order a Cake* 🍰\n2️⃣ *Normal Chat* 💬\n\n_Please reply with 1 or 2_`);
+            return;
+        }
+
+        // Handle specific states
+        if (state === 'START_MENU') {
+            if (lowerInput === '1') {
+                stateManager.updateState(phone, 'ORDERING');
+                // Allow it to fall through to AI processing later, but first send the greeting/menu
+                const menuText = store.getMenuText();
+                await sendText(chatId, `🎂 Great! Here is our current menu:\n\n${menuText}\n\nWhat would you like to order? You can describe it naturally! ✨`);
+                stateManager.addToHistory(phone, 'assistant', 'Showed menu and asked for order');
+                return;
+            } else if (lowerInput === '2') {
+                stateManager.updateState(phone, 'NORMAL_CHAT');
+                await sendText(chatId, `👍 Okay, normal chat enabled. I won't bother you with order questions for now.\n\nIf you want to order a cake later, just say *Hi* or *Order*!`);
+                return;
+            } else {
+                await sendText(chatId, `❓ Please reply with *1* to order a cake or *2* for normal chat.`);
+                return;
+            }
+        }
+
+        if (state === 'NORMAL_CHAT') {
+            if (lowerInput === 'order' || lowerInput === 'order cake') {
+                stateManager.updateState(phone, 'ORDERING');
+                // Fall through to AI
+            } else {
+                // In normal chat, we don't respond unless they want to order
+                return;
+            }
+        }
+
         // ─── COMPLETED: Any new message restarts the flow ───
         if (state === 'COMPLETED') {
             stateManager.clearSession(phone);

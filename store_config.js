@@ -6,7 +6,7 @@ const CONFIG_FILE = path.join(__dirname, 'store_data.json');
 // Default configuration
 const DEFAULT_CONFIG = {
     isOpen: true,
-    shopName: 'Sweet Delights Bakery',
+    shopName: 'Guga Gugi backery',
     closedMessage: "We're closed for today 🌙\nOur hours: 9 AM - 9 PM\nType *order* when we're open!",
     deliveryHours: '6-8 PM',
     pickupDeadline: '5 PM',
