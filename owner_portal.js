@@ -190,17 +190,17 @@ async function handleOrderStatus(orderId, statusText) {
     return `❌ Order ${orderId} not found in records`;
 }
 
-// ─── View Today's Orders ───
+// ─── View Recent Orders ───
 async function handleViewOrders(phone) {
     setOwnerState(phone, { menu: 'MAIN' });
     try {
-        const todayOrders = await sheets.getTodaysOrders();
-        if (!todayOrders || todayOrders.length === 0) {
-            return `📋 *Today's Orders*\n\nNo orders yet today.\n\n${getMainMenu()}`;
+        const recentOrders = await sheets.getTodaysOrders(); // Now returns last 20 orders overall
+        if (!recentOrders || recentOrders.length === 0) {
+            return `📋 *Recent Orders*\n\nNo orders found in records.\n\n${getMainMenu()}`;
         }
 
-        let text = `📋 *Today's Orders* (${todayOrders.length})\n\n`;
-        todayOrders.forEach((order, i) => {
+        let text = `📋 *Recent Orders* (${recentOrders.length})\n\n`;
+        recentOrders.forEach((order, i) => {
             text += `${i + 1}. *${order.id}* — ${order.cake} ${order.weight}\n`;
             text += `   ${order.mode} | ${order.status || 'New'}\n`;
         });

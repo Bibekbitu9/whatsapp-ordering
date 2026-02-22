@@ -87,6 +87,17 @@ async function finalizeOrder(phone, chatId, session) {
     if (price) summary += ` | ₹${price}`;
     console.log(`\n🔔 ${summary}`);
 
+    // Notify the owner on WhatsApp
+    // Use activePortalChatId if available, otherwise fallback to the configured owner number
+    const ownerChatId = activePortalChatId || getOwnerChatId();
+    if (ownerChatId) {
+        try {
+            await sendText(ownerChatId, `🔔 *NEW ORDER*\n\n${summary}`);
+        } catch (err) {
+            console.error('❌ Failed to send order notification to owner:', err.message);
+        }
+    }
+
     stateManager.updateState(phone, 'COMPLETED');
     return orderData;
 }
@@ -97,28 +108,66 @@ async function handleCustomRequest(phone, chatId, message) {
 }
 
 // ═══════════════════════════════════════════
+// Dynamically track which chat ID the user opened the portal in to avoid intercepting customer messages
+let activePortalChatId = null;
+
 // ─── OWNER PORTAL (self-messages via message_create) ───
 // ═══════════════════════════════════════════
 client.on('message_create', async (msg) => {
     if (!msg.fromMe) return;
     if (msg.from.includes('@g.us') || msg.from === 'status@broadcast') return;
 
-    // RESTRICTION: Only process owner portal for self-chats (messages sent TO the owner number)
-    if (msg.to !== getOwnerChatId()) return;
+    // Use client.info.wid to get the bot's own internal phone number
+    const botNumInfo = client.info?.wid;
+    const botNum = botNumInfo ? botNumInfo.user : '';
+
+    const selfInput = msg.body?.trim();
+    if (!selfInput) return;
+    const lowerInput = selfInput.toLowerCase();
+
+    const fromUser = msg.from.split('@')[0].split(':')[0];
+    const toUser = msg.to.split('@')[0].split(':')[0];
+
+    const isSelf = fromUser === toUser;
+    const isToBot = toUser === botNum;
+    const ownerPhone = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
+    const ownerPhoneWithCountry = ownerPhone.startsWith('91') ? ownerPhone : `91${ownerPhone}`;
+    const isToOwner = toUser === ownerPhoneWithCountry;
+
+    // If the owner types "admin", we lock the portal to whatever chat they typed it in.
+    if (lowerInput === 'admin') {
+        activePortalChatId = msg.to;
+    }
+
+    // A message is meant for the owner portal if:
+    // 1. It's strictly addressed to the bot's own raw number (isToBot, isSelf, isToOwner)
+    // 2. OR it's addressed to the specific chat ID where the portal was opened (handles @lid self-chat routing)
+    const isPortalChat = isSelf || isToBot || isToOwner || (activePortalChatId && msg.to === activePortalChatId);
+
+    if (!isPortalChat) {
+        return; // Ignore regular outgoing messages to customers
+    }
+
+    // Ignore automated notifications sent by the bot to the owner (prevents "Invalid option" loops)
+    if (selfInput.startsWith('🔔') || selfInput.startsWith('❓') || selfInput.startsWith('👋') || selfInput.startsWith('📋') || selfInput.startsWith('💰')) {
+        return;
+    }
 
     // Prevent infinite loop: skip if we're already processing an owner command
     if (isProcessingOwner) return;
 
-    const selfInput = msg.body?.trim();
-    if (!selfInput) return;
+    // Determine the chat to send responses back to
+    const chatId = msg.to === activePortalChatId ? msg.to : (msg.to !== botNum ? msg.to : msg.from);
+    // For self-messages, force the state manager to use the bot/owner's clean number
+    const phone = botNum || ownerPhoneWithCountry;
 
-    // For self-messages, use msg.to (the chat we're sending to)
-    const chatId = msg.to || msg.from;
-    const phone = chatId.replace('@c.us', '').replace('@lid', '');
+    if (lowerInput !== 'admin') {
+        // Only log non-admin inputs so we don't spam if they just typed admin
+        console.log(`\n👤 Owner portal input: "${selfInput}"`);
+    } else {
+        console.log(`\n🔑 Owner portal UNLOCKED in chat: ${activePortalChatId || 'self'}`);
+    }
 
-    // fromMe=true means this is sent FROM the bot's connected phone
-    // Since the bot IS the owner's phone, all self-messages are owner messages
-    console.log(`\n👤 Owner portal: "${selfInput}"`);
 
     isProcessingOwner = true;
     try {
@@ -181,12 +230,6 @@ client.on('message', async (msg) => {
 
     if (!input && !isLocation) return;
 
-    // Check if store is closed
-    if (!store.isOpen()) {
-        await sendText(chatId, store.getClosedMessage());
-        return;
-    }
-
     const session = stateManager.getSession(phone);
     const state = session.state;
     const lowerInput = input ? input.toLowerCase() : '';
@@ -195,13 +238,22 @@ client.on('message', async (msg) => {
         // ─── Interaction Menu Interceptor ───
         if (lowerInput === 'hi' || lowerInput === 'hello' || lowerInput === 'hey') {
             stateManager.updateState(phone, 'START_MENU');
-            await sendText(chatId, `🎂 Welcome to *${store.getShopName()}*! How can I help you today?\n\n1️⃣ *Order a Cake* 🍰\n2️⃣ *Normal Chat* 💬\n\n_Please reply with 1 or 2_`);
+            if (store.isOpen()) {
+                await sendText(chatId, `🎂 Welcome to *${store.getShopName()}*! How can I help you today?\n\n1️⃣ *Order a Cake* 🍰\n2️⃣ *Normal Chat* 💬\n\n_Please reply with 1 or 2_`);
+            } else {
+                await sendText(chatId, `🎂 Welcome to *${store.getShopName()}*!\n\n${store.getClosedMessage()}\n\nHowever, you can still:\n1️⃣ *Check Menu* 🍰\n2️⃣ *Normal Chat* 💬\n\n_Please reply with 1 or 2_`);
+            }
             return;
         }
 
         // Handle specific states
         if (state === 'START_MENU') {
             if (lowerInput === '1') {
+                if (!store.isOpen()) {
+                    stateManager.clearSession(phone);
+                    await sendText(chatId, `We are currently closed for orders.\n\n${store.getMenuText()}\n\nPlease return during our working hours to place an order!`);
+                    return;
+                }
                 stateManager.updateState(phone, 'ORDERING');
                 // Allow it to fall through to AI processing later, but first send the greeting/menu
                 const menuText = store.getMenuText();
@@ -220,6 +272,10 @@ client.on('message', async (msg) => {
 
         if (state === 'NORMAL_CHAT') {
             if (lowerInput === 'order' || lowerInput === 'order cake') {
+                if (!store.isOpen()) {
+                    await sendText(chatId, store.getClosedMessage());
+                    return;
+                }
                 stateManager.updateState(phone, 'ORDERING');
                 // Fall through to AI
             } else {
@@ -228,11 +284,40 @@ client.on('message', async (msg) => {
             }
         }
 
-        // ─── COMPLETED: Any new message restarts the flow ───
+        // ─── Store Closed Check (for any other messages) ───
+        // Since NORMAL_CHAT intercepts and returns early above, and START_MENU handles itself,
+        // reaching this point means they are trying to order or send random messages.
+        if (!store.isOpen()) {
+            await sendText(chatId, store.getClosedMessage());
+            return;
+        }
+
+        // ─── COMPLETED: Prevent post-order spam ───
         if (state === 'COMPLETED') {
-            stateManager.clearSession(phone);
-            const newSession = stateManager.getSession(phone);
-            await processWithAI(phone, chatId, input, newSession);
+            const thankYouTriggers = ['thanks', 'thank you', 'thx', 'tq', 'ty'];
+            const isThankYou = thankYouTriggers.some(t => lowerInput.includes(t));
+
+            if (isThankYou) {
+                // Acknowledge thanks quietly without restarting the flow
+                await sendText(chatId, `You're very welcome! Let us know whenever you need another cake. 🎂`);
+                return;
+            }
+
+            const restartTriggers = ['hi', 'hello', 'hey', 'order', 'menu'];
+            const isRestart = restartTriggers.some(t => lowerInput === t || lowerInput.includes('order cake') || lowerInput.includes('new order'));
+
+            if (isRestart) {
+                stateManager.clearSession(phone);
+                // The next message loop will catch this since we cleared it, but to be safe, just route it to the menu:
+                stateManager.updateState(phone, 'START_MENU');
+                if (store.isOpen()) {
+                    await sendText(chatId, `🎂 Welcome back to *${store.getShopName()}*! How can I help you today?\n\n1️⃣ *Order a Cake* 🍰\n2️⃣ *Normal Chat* 💬\n\n_Please reply with 1 or 2_`);
+                } else {
+                    await sendText(chatId, `🎂 Welcome back to *${store.getShopName()}*!\n\n${store.getClosedMessage()}\n\nHowever, you can still:\n1️⃣ *Check Menu* 🍰\n2️⃣ *Normal Chat* 💬\n\n_Please reply with 1 or 2_`);
+                }
+            }
+
+            // Ignore any other casual chatter while in COMPLETED state
             return;
         }
 

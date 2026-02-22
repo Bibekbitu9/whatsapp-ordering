@@ -163,13 +163,12 @@ async function getTodaysOrders() {
         });
 
         const rows = response.data.values || [];
-        const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 
-        return rows.filter(row => {
-            // Column B (index 1) = date
-            if (!row[1]) return false;
-            return row[1].startsWith(today);
-        }).map(row => ({
+        // Grab the last 20 orders instead of strict daily filtering to avoid timezone/format bugs
+        const recentRows = rows.slice(-20).reverse(); // Newest first
+
+        // Filter out empty rows just in case
+        return recentRows.filter(row => row[0] && row[0].startsWith('CAKE')).map(row => ({
             id: row[0],
             date: row[1],
             phone: row[2],
